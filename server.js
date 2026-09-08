@@ -1,11 +1,13 @@
 import express from 'express';
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import makeWASocketImport, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImport : (makeWASocketImport.default || makeWASocketImport);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,7 +20,8 @@ const messageHistory = [];
 // חיבור לוואטסאפ באמצעות Baileys
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  sock = makeWASocket.default({
+  
+  sock = makeWASocket({
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
     auth: state,
@@ -88,7 +91,6 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
   throw new Error('Unknown tool');
 });
 
-// מסלול מיוחד שמונע מהשרת ללכת לישון
 app.get('/', (req, res) => {
   res.send(`Server is running! WhatsApp Status: ${isConnected ? 'Connected' : (qrCodeText ? 'Waiting for QR scan' : 'Connecting...')}`);
 });

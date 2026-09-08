@@ -1,15 +1,31 @@
 import express from 'express';
+import { randomUUID } from 'node:crypto';
 import makeWASocketImport, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { isInitializeRequest, CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImport : (makeWASocketImport.default || makeWASocketImport);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// תמיכה ב-CORS עבור שרתי Google ו-Gemini
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Expose-Headers', '*');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
+app.use(express.json());
 
 let sock;
 let qrCodeText = '';
@@ -60,7 +76,7 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// דף אינטרנט שמציג את קוד ה-QR כתמונה נוחה לסריקה
+// עמוד הסטטוס / QR
 app.get('/', (req, res) => {
   if (isConnected) {
     res.send(`
@@ -78,69 +94,121 @@ app.get('/', (req, res) => {
     res.send(`
       <!DOCTYPE html>
       <html dir="rtl">
-      <head>
-        <meta charset="utf-8">
-        <title>סריקת קוד וואטסאפ</title>
-        <meta http-equiv="refresh" content="15">
-      </head>
+      <head><meta charset="utf-8"><title>סריקת קוד וואטסאפ</title><meta http-equiv="refresh" content="15"></head>
       <body style="font-family:sans-serif;text-align:center;padding:40px;">
         <h2>סרוק את קוד ה-QR עם אפליקציית וואטסאפ</h2>
-        <p style="color:#555;">פתח את וואטסאפ בטלפון/טאבלט > הגדרות > מכשירים מקושרים > קשר מכשיר</p>
-        <div style="margin:20px 0;">
-          <img src="${qrUrl}" alt="QR Code" style="border: 4px solid #25D366; border-radius: 12px; padding: 10px;" />
-        </div>
-        <p style="color:gray;font-size:13px;">העמוד מתרענן אוטומטית כל 15 שניות</p>
+        <div style="margin:20px 0;"><img src="${qrUrl}" alt="QR Code" style="border:4px solid #25D366;border-radius:12px;padding:10px;" /></div>
       </body>
       </html>
     `);
   } else {
-    res.send(`
-      <!DOCTYPE html>
-      <html dir="rtl">
-      <head><meta charset="utf-8"><meta http-equiv="refresh" content="3"><title>טוען...</title></head>
-      <body style="font-family:sans-serif;text-align:center;padding:50px;">
-        <h2>מייצר קוד QR, אנא המתן מספר שניות...</h2>
-      </body>
-      </html>
-    `);
+    res.send(`<h2 style="text-align:center;margin-top:50px;">מתחבר לוואטסאפ...</h2>`);
   }
 });
 
-// שרת MCP לחיבור עם Gemini Spark
-const mcpServer = new Server({ name: 'whatsapp-mcp', version: '1.0.0' }, { capabilities: { tools: {} } });
+// יצירת מופע שרת MCP
+function createMcpServer() {
+  const server = new Server(
+    { name: 'whatsapp-mcp', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  );
 
-mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'get_recent_messages',
-      description: 'שליפת ההודעות האחרונות שהתקבלו מלקוחות בוואטסאפ',
-      inputSchema: {
-        type: 'object',
-        properties: { count: { type: 'number', description: 'כמות הודעות' } },
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: [
+      {
+        name: 'get_recent_messages',
+        description: 'שליפת ההודעות האחרונות שהתקבלו מלקוחות בוואטסאפ וסיכומן',
+        inputSchema: {
+          type: 'object',
+          properties: { count: { type: 'number', description: 'כמות הודעות' } },
+        },
       },
-    },
-  ],
-}));
+    ],
+  }));
 
-mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === 'get_recent_messages') {
-    const count = request.params.arguments?.count || 10;
-    const messages = messageHistory.slice(-count);
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ isConnected, messages }) }],
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name === 'get_recent_messages') {
+      const count = request.params.arguments?.count || 10;
+      const messages = messageHistory.slice(-count);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ isConnected, messages }) }],
+      };
+    }
+    throw new Error('Unknown tool');
+  });
+
+  return server;
+}
+
+const streamableTransports = {};
+const sseTransports = {};
+
+// טיפול בבקשות POST מ-Gemini Spark (Streamable HTTP)
+app.post('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  let transport;
+
+  if (sessionId && streamableTransports[sessionId]) {
+    transport = streamableTransports[sessionId];
+  } else if (!sessionId && isInitializeRequest(req.body)) {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (sid) => {
+        streamableTransports[sid] = transport;
+      },
+      enableDnsRebindingProtection: false,
+    });
+    transport.onclose = () => {
+      if (transport.sessionId) delete streamableTransports[transport.sessionId];
     };
+    const server = createMcpServer();
+    await server.connect(transport);
+  } else {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      enableDnsRebindingProtection: false,
+    });
+    const server = createMcpServer();
+    await server.connect(transport);
   }
-  throw new Error('Unknown tool');
+
+  await transport.handleRequest(req, res, req.body);
 });
 
-let transport;
+// טיפול בבקשות GET מ-Gemini Spark
 app.get('/mcp', async (req, res) => {
-  transport = new SSEServerTransport('/messages', res);
-  await mcpServer.connect(transport);
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && streamableTransports[sessionId]) {
+    await streamableTransports[sessionId].handleRequest(req, res);
+    return;
+  }
+
+  const sseTransport = new SSEServerTransport('/mcp/messages', res);
+  sseTransports[sseTransport.sessionId] = sseTransport;
+  sseTransport.onclose = () => {
+    delete sseTransports[sseTransport.sessionId];
+  };
+  const server = createMcpServer();
+  await server.connect(sseTransport);
 });
 
-app.post('/messages', async (req, res) => {
-  if (transport) await transport.handlePostMessage(req, res);
+app.post('/mcp/messages', async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const transport = sseTransports[sessionId];
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(404).send('Session not found');
+  }
+});
+
+app.delete('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'];
+  if (sessionId && streamableTransports[sessionId]) {
+    await streamableTransports[sessionId].handleRequest(req, res);
+  } else {
+    res.status(400).send('Invalid or missing session ID');
+  }
 });
 
 app.listen(PORT, () => {

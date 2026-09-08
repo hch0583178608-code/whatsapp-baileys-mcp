@@ -1,0 +1,1 @@
+# whatsapp-baileys-mcp

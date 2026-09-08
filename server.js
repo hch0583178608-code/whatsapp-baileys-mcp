@@ -13,7 +13,7 @@ const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImpo
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// רשימת הקבוצות היחידות שמאושרות לשמירה (כל שאר הקבוצות מסוננות):
+// רשימת הקבוצות המאושרות לשמירה (כל שאר הקבוצות יסוננו):
 const ALLOWED_GROUPS = [
   'תכנה הפעלה חיה',
   'תוכנה הפעלה חיה',
@@ -38,10 +38,19 @@ app.use(express.json());
 let sock;
 let qrCodeText = '';
 let isConnected = false;
-const messageHistory = [];
+const messageHistory = []; // מאגר מוגדל של עד 200 הודעות
 const groupNameCache = new Map();
 
-// פונקציה לבדיקת שם הקבוצה
+// המרת מספר טלפון ישראלי/בינלאומי ל-JID תקין של וואטסאפ
+function formatToJid(phone) {
+  let clean = phone.replace(/[^0-9]/g, '');
+  if (clean.startsWith('0')) {
+    clean = '972' + clean.slice(1);
+  }
+  return clean.includes('@') ? clean : `${clean}@s.whatsapp.net`;
+}
+
+// בדיקת שם קבוצה
 async function getGroupName(jid) {
   if (groupNameCache.has(jid)) return groupNameCache.get(jid);
   try {
@@ -52,6 +61,21 @@ async function getGroupName(jid) {
     }
   } catch (e) {}
   return '';
+}
+
+// חילוץ תוכן טקסטואלי או סוג מדיה
+function extractMessageContent(message) {
+  if (!message) return '';
+  if (message.conversation) return message.conversation;
+  if (message.extendedTextMessage?.text) return message.extendedTextMessage.text;
+  if (message.imageMessage) return `[תמונה${message.imageMessage.caption ? ': ' + message.imageMessage.caption : ''}]`;
+  if (message.audioMessage) return '[הודעה קולית / הקלטה]';
+  if (message.videoMessage) return `[סרטון${message.videoMessage.caption ? ': ' + message.videoMessage.caption : ''}]`;
+  if (message.documentMessage) return `[מסמך: ${message.documentMessage.fileName || 'קובץ'}]`;
+  if (message.locationMessage) return `[מיקום ששותף]`;
+  if (message.contactMessage || message.contactsArrayMessage) return `[שיתוף איש קשר]`;
+  if (message.stickerMessage) return `[מדבקה]`;
+  return '[הודעה]';
 }
 
 async function connectToWhatsApp() {
@@ -81,32 +105,31 @@ async function connectToWhatsApp() {
 
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
-    if (!msg.key.fromMe && m.type === 'notify') {
+    if (m.type === 'notify' && msg.message) {
       const sender = msg.key.remoteJid;
       const isGroup = sender.endsWith('@g.us');
-      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
-      let chatDisplayName = msg.pushName || 'לקוח';
+      const isFromMe = msg.key.fromMe;
+      let chatDisplayName = isFromMe ? '[אני]' : (msg.pushName || 'לקוח');
 
-      // סינון קבוצות:
+      // סינון קבוצות
       if (isGroup) {
         const groupTitle = await getGroupName(sender);
         const isAllowed = ALLOWED_GROUPS.some(allowed => groupTitle.includes(allowed));
-        
-        // אם זו קבוצה שלא ברשימה המאושרת (כמו קבוצות דרייברים) - זורקים אותה
-        if (!isAllowed) {
-          return;
-        }
+        if (!isAllowed) return; // התעלמות מקבוצות שלא ברשימה המאושרת
         chatDisplayName = `[קבוצה: ${groupTitle}] ${chatDisplayName}`;
       }
 
-      if (text) {
+      const content = extractMessageContent(msg.message);
+
+      if (content) {
         messageHistory.push({
           from: sender,
           name: chatDisplayName,
-          text,
+          isFromMe,
+          text: content,
           time: new Date().toISOString(),
         });
-        if (messageHistory.length > 50) messageHistory.shift();
+        if (messageHistory.length > 200) messageHistory.shift();
       }
     }
   });
@@ -130,9 +153,10 @@ app.get('/qr', (req, res) => {
   }
 });
 
+// שרת MCP מורחב עבור Gemini Spark
 function createMcpServer() {
   const server = new Server(
-    { name: 'whatsapp-mcp', version: '1.0.0' },
+    { name: 'whatsapp-mcp', version: '2.0.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -140,24 +164,85 @@ function createMcpServer() {
     tools: [
       {
         name: 'get_recent_messages',
-        description: 'שליפת הודעות מלקוחות פרטיים ומהקבוצות המורשות בלבד',
+        description: 'שליפת הודעות מלקוחות ומהקבוצות המורשות. ניתן לסנן לפי מילת חיפוש או שם לקוח.',
         inputSchema: {
           type: 'object',
-          properties: { count: { type: 'number', description: 'כמות הודעות' } },
+          properties: {
+            count: { type: 'number', description: 'כמות הודעות לשליפה (ברירת מחדל 15)' },
+            search: { type: 'string', description: 'סינון לפי מילת מפתח, שם לקוח או מספר טלפון (אופציונלי)' },
+          },
         },
+      },
+      {
+        name: 'send_whatsapp_message',
+        description: 'שליחת הודעת וואטסאפ לכל מספר טלפון (חדש או קיים). מתאים גם למספרים שלא שמורים באנשי קשר.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            phone: { type: 'string', description: 'מספר טלפון של הנמען (למשל: 0501234567 או +972...)' },
+            message: { type: 'string', description: 'תוכן ההודעה לשליחה' },
+          },
+          required: ['phone', 'message'],
+        },
+      },
+      {
+        name: 'list_active_chats',
+        description: 'קבלת רשימה מרוכזת של כל הלקוחות והשיחות האחרונות שפנו אליך, כולל ההודעה האחרונה שלהם.',
+        inputSchema: { type: 'object', properties: {} },
       },
     ],
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name === 'get_recent_messages') {
-      const count = request.params.arguments?.count || 10;
-      const messages = messageHistory.slice(-count);
+    const { name, arguments: args } = request.params;
+
+    // 1. שליפת הודעות אחרונות
+    if (name === 'get_recent_messages') {
+      const count = args?.count || 15;
+      const search = args?.search?.toLowerCase();
+      
+      let filtered = messageHistory;
+      if (search) {
+        filtered = filtered.filter(m => 
+          m.text.toLowerCase().includes(search) || 
+          m.name.toLowerCase().includes(search) || 
+          m.from.includes(search)
+        );
+      }
       return {
-        content: [{ type: 'text', text: JSON.stringify({ isConnected, messages }) }],
+        content: [{ type: 'text', text: JSON.stringify({ isConnected, messages: filtered.slice(-count) }) }],
       };
     }
-    throw new Error('Unknown tool');
+
+    // 2. שליחת הודעה
+    if (name === 'send_whatsapp_message') {
+      if (!sock || !isConnected) {
+        throw new Error('וואטסאפ אינו מחובר כרגע. אנא ודא חיבור בשרת.');
+      }
+      const targetJid = formatToJid(args.phone);
+      await sock.sendMessage(targetJid, { text: args.message });
+      return {
+        content: [{ type: 'text', text: `ההודעה נשלחה בהצלחה למספר ${args.phone}!` }],
+      };
+    }
+
+    // 3. רשימת לקוחות ושיחות פעילות
+    if (name === 'list_active_chats') {
+      const chatsMap = new Map();
+      for (const m of messageHistory) {
+        chatsMap.set(m.from, {
+          from: m.from,
+          name: m.name,
+          lastMessage: m.text,
+          lastTime: m.time,
+        });
+      }
+      return {
+        content: [{ type: 'text', text: JSON.stringify(Array.from(chatsMap.values())) }],
+      };
+    }
+
+    throw new Error(`כלי לא מוכר: ${name}`);
   });
 
   return server;

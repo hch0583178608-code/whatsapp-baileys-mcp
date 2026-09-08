@@ -13,19 +13,23 @@ const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImpo
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// כותרות CORS מלאות לכל הכתובות של גוגל
+// כותרות CORS
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, HEAD');
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Access-Control-Expose-Headers', '*');
+  
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
+  }
+  // מענה מיידי לבדיקת התקינות של גוגל (HEAD)
+  if (req.method === 'HEAD') {
+    return res.status(200).end();
   }
   next();
 });
 
-// הדפסת כל בקשה שמגיעה מהעולם (כדי שנראה את גוגל ביומן)
 app.use((req, res, next) => {
   console.log(`>>> [INCOMING] ${req.method} ${req.url}`);
   next();
@@ -82,7 +86,6 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// עמוד סריקת QR למשתמש
 app.get('/qr', (req, res) => {
   if (isConnected) {
     res.send('<h1 style="color:green;text-align:center;">וואטסאפ מחובר בהצלחה! 🎉</h1>');
@@ -92,11 +95,10 @@ app.get('/qr', (req, res) => {
       <div style="text-align:center;padding:30px;font-family:sans-serif;">
         <h2>סרוק את הקוד עם וואטסאפ</h2>
         <img src="${qrUrl}" style="border:4px solid #25D366;border-radius:10px;padding:10px;" />
-        <p>פתח את וואטסאפ > הגדרות > מכשירים מקושרים > קשר מכשיר</p>
       </div>
     `);
   } else {
-    res.send('<h2 style="text-align:center;">מייצר קוד QR, רענן עוד 5 שניות...</h2>');
+    res.send('<h2 style="text-align:center;">טוען...</h2>');
   }
 });
 
@@ -136,7 +138,6 @@ function createMcpServer() {
 const streamableTransports = {};
 const sseTransports = {};
 
-// טיפול ב-POST עבור MCP
 async function handleMcpPost(req, res) {
   const sessionId = req.headers['mcp-session-id'];
   let transport;
@@ -168,7 +169,6 @@ async function handleMcpPost(req, res) {
   await transport.handleRequest(req, res, req.body);
 }
 
-// טיפול ב-GET עבור MCP
 async function handleMcpGet(req, res) {
   const sessionId = req.headers['mcp-session-id'];
   if (sessionId && streamableTransports[sessionId]) {

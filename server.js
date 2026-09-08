@@ -13,25 +13,23 @@ const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImpo
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// כותרות CORS
+// רשימת הקבוצות היחידות שמאושרות לשמירה (כל שאר הקבוצות מסוננות):
+const ALLOWED_GROUPS = [
+  'תכנה הפעלה חיה',
+  'תוכנה הפעלה חיה',
+  'מערכי שיעור חוג חיות',
+  'פורום לעסקי חיות חרדיים/ דתיים',
+  'פורום לעסקי חיות',
+];
+
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, HEAD');
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Access-Control-Expose-Headers', '*');
   
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  // מענה מיידי לבדיקת התקינות של גוגל (HEAD)
-  if (req.method === 'HEAD') {
-    return res.status(200).end();
-  }
-  next();
-});
-
-app.use((req, res, next) => {
-  console.log(`>>> [INCOMING] ${req.method} ${req.url}`);
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  if (req.method === 'HEAD') return res.status(200).end();
   next();
 });
 
@@ -41,6 +39,20 @@ let sock;
 let qrCodeText = '';
 let isConnected = false;
 const messageHistory = [];
+const groupNameCache = new Map();
+
+// פונקציה לבדיקת שם הקבוצה
+async function getGroupName(jid) {
+  if (groupNameCache.has(jid)) return groupNameCache.get(jid);
+  try {
+    const meta = await sock.groupMetadata(jid);
+    if (meta?.subject) {
+      groupNameCache.set(jid, meta.subject);
+      return meta.subject;
+    }
+  } catch (e) {}
+  return '';
+}
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
@@ -53,10 +65,7 @@ async function connectToWhatsApp() {
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      qrCodeText = qr;
-      console.log('--- QR CODE READY ---');
-    }
+    if (qr) qrCodeText = qr;
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
       isConnected = false;
@@ -73,11 +82,30 @@ async function connectToWhatsApp() {
   sock.ev.on('messages.upsert', async (m) => {
     const msg = m.messages[0];
     if (!msg.key.fromMe && m.type === 'notify') {
-      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
       const sender = msg.key.remoteJid;
-      const name = msg.pushName || 'Unknown';
+      const isGroup = sender.endsWith('@g.us');
+      const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+      let chatDisplayName = msg.pushName || 'לקוח';
+
+      // סינון קבוצות:
+      if (isGroup) {
+        const groupTitle = await getGroupName(sender);
+        const isAllowed = ALLOWED_GROUPS.some(allowed => groupTitle.includes(allowed));
+        
+        // אם זו קבוצה שלא ברשימה המאושרת (כמו קבוצות דרייברים) - זורקים אותה
+        if (!isAllowed) {
+          return;
+        }
+        chatDisplayName = `[קבוצה: ${groupTitle}] ${chatDisplayName}`;
+      }
+
       if (text) {
-        messageHistory.push({ from: sender, name, text, time: new Date().toISOString() });
+        messageHistory.push({
+          from: sender,
+          name: chatDisplayName,
+          text,
+          time: new Date().toISOString(),
+        });
         if (messageHistory.length > 50) messageHistory.shift();
       }
     }
@@ -112,7 +140,7 @@ function createMcpServer() {
     tools: [
       {
         name: 'get_recent_messages',
-        description: 'שליפת ההודעות האחרונות מלקוחות בוואטסאפ',
+        description: 'שליפת הודעות מלקוחות פרטיים ומהקבוצות המורשות בלבד',
         inputSchema: {
           type: 'object',
           properties: { count: { type: 'number', description: 'כמות הודעות' } },

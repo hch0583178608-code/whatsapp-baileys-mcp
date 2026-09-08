@@ -13,7 +13,7 @@ const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImpo
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// תמיכה ב-CORS עבור שרתי Google ו-Gemini
+// כותרות CORS מלאות לכל הכתובות של גוגל
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
@@ -22,6 +22,12 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
+  next();
+});
+
+// הדפסת כל בקשה שמגיעה מהעולם (כדי שנראה את גוגל ביומן)
+app.use((req, res, next) => {
+  console.log(`>>> [INCOMING] ${req.method} ${req.url}`);
   next();
 });
 
@@ -45,7 +51,7 @@ async function connectToWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       qrCodeText = qr;
-      console.log('--- QR CODE GENERATED ---');
+      console.log('--- QR CODE READY ---');
     }
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
@@ -76,37 +82,24 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// עמוד הסטטוס / QR
-app.get('/', (req, res) => {
+// עמוד סריקת QR למשתמש
+app.get('/qr', (req, res) => {
   if (isConnected) {
-    res.send(`
-      <!DOCTYPE html>
-      <html dir="rtl">
-      <head><meta charset="utf-8"><title>סטטוס וואטסאפ</title></head>
-      <body style="font-family:sans-serif;text-align:center;padding:50px;">
-        <h1 style="color:#25D366;">וואטסאפ מחובר בהצלחה! 🎉</h1>
-        <p style="font-size:18px;">השרת מוכן כעת לשימוש ב-Gemini Spark.</p>
-      </body>
-      </html>
-    `);
+    res.send('<h1 style="color:green;text-align:center;">וואטסאפ מחובר בהצלחה! 🎉</h1>');
   } else if (qrCodeText) {
     const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(qrCodeText)}`;
     res.send(`
-      <!DOCTYPE html>
-      <html dir="rtl">
-      <head><meta charset="utf-8"><title>סריקת קוד וואטסאפ</title><meta http-equiv="refresh" content="15"></head>
-      <body style="font-family:sans-serif;text-align:center;padding:40px;">
-        <h2>סרוק את קוד ה-QR עם אפליקציית וואטסאפ</h2>
-        <div style="margin:20px 0;"><img src="${qrUrl}" alt="QR Code" style="border:4px solid #25D366;border-radius:12px;padding:10px;" /></div>
-      </body>
-      </html>
+      <div style="text-align:center;padding:30px;font-family:sans-serif;">
+        <h2>סרוק את הקוד עם וואטסאפ</h2>
+        <img src="${qrUrl}" style="border:4px solid #25D366;border-radius:10px;padding:10px;" />
+        <p>פתח את וואטסאפ > הגדרות > מכשירים מקושרים > קשר מכשיר</p>
+      </div>
     `);
   } else {
-    res.send(`<h2 style="text-align:center;margin-top:50px;">מתחבר לוואטסאפ...</h2>`);
+    res.send('<h2 style="text-align:center;">מייצר קוד QR, רענן עוד 5 שניות...</h2>');
   }
 });
 
-// יצירת מופע שרת MCP
 function createMcpServer() {
   const server = new Server(
     { name: 'whatsapp-mcp', version: '1.0.0' },
@@ -117,7 +110,7 @@ function createMcpServer() {
     tools: [
       {
         name: 'get_recent_messages',
-        description: 'שליפת ההודעות האחרונות שהתקבלו מלקוחות בוואטסאפ וסיכומן',
+        description: 'שליפת ההודעות האחרונות מלקוחות בוואטסאפ',
         inputSchema: {
           type: 'object',
           properties: { count: { type: 'number', description: 'כמות הודעות' } },
@@ -143,8 +136,8 @@ function createMcpServer() {
 const streamableTransports = {};
 const sseTransports = {};
 
-// טיפול בבקשות POST מ-Gemini Spark (Streamable HTTP)
-app.post('/mcp', async (req, res) => {
+// טיפול ב-POST עבור MCP
+async function handleMcpPost(req, res) {
   const sessionId = req.headers['mcp-session-id'];
   let transport;
 
@@ -173,23 +166,37 @@ app.post('/mcp', async (req, res) => {
   }
 
   await transport.handleRequest(req, res, req.body);
-});
+}
 
-// טיפול בבקשות GET מ-Gemini Spark
-app.get('/mcp', async (req, res) => {
+// טיפול ב-GET עבור MCP
+async function handleMcpGet(req, res) {
   const sessionId = req.headers['mcp-session-id'];
   if (sessionId && streamableTransports[sessionId]) {
     await streamableTransports[sessionId].handleRequest(req, res);
     return;
   }
 
-  const sseTransport = new SSEServerTransport('/mcp/messages', res);
+  const host = req.get('host');
+  const protocol = req.protocol;
+  const endpointUrl = `${protocol}://${host}/mcp/messages`;
+
+  const sseTransport = new SSEServerTransport(endpointUrl, res);
   sseTransports[sseTransport.sessionId] = sseTransport;
   sseTransport.onclose = () => {
     delete sseTransports[sseTransport.sessionId];
   };
   const server = createMcpServer();
   await server.connect(sseTransport);
+}
+
+app.post('/mcp', handleMcpPost);
+app.get('/mcp', handleMcpGet);
+app.post('/', handleMcpPost);
+app.get('/', (req, res) => {
+  if (req.headers.accept?.includes('text/event-stream')) {
+    return handleMcpGet(req, res);
+  }
+  res.redirect('/qr');
 });
 
 app.post('/mcp/messages', async (req, res) => {
@@ -199,15 +206,6 @@ app.post('/mcp/messages', async (req, res) => {
     await transport.handlePostMessage(req, res);
   } else {
     res.status(404).send('Session not found');
-  }
-});
-
-app.delete('/mcp', async (req, res) => {
-  const sessionId = req.headers['mcp-session-id'];
-  if (sessionId && streamableTransports[sessionId]) {
-    await streamableTransports[sessionId].handleRequest(req, res);
-  } else {
-    res.status(400).send('Invalid or missing session ID');
   }
 });
 

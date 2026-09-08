@@ -2,7 +2,6 @@ import express from 'express';
 import makeWASocketImport, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
-import qrcode from 'qrcode-terminal';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -17,7 +16,6 @@ let qrCodeText = '';
 let isConnected = false;
 const messageHistory = [];
 
-// חיבור לוואטסאפ באמצעות Baileys
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
   
@@ -31,13 +29,11 @@ async function connectToWhatsApp() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       qrCodeText = qr;
-      console.log('--- QR CODE READY ---');
-      qrcode.generate(qr, { small: true });
+      console.log('--- QR CODE GENERATED ---');
     }
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
       isConnected = false;
-      console.log('Connection closed, reconnecting:', shouldReconnect);
       if (shouldReconnect) connectToWhatsApp();
     } else if (connection === 'open') {
       isConnected = true;
@@ -64,7 +60,53 @@ async function connectToWhatsApp() {
 
 connectToWhatsApp();
 
-// שרת MCP עבור Gemini
+// דף אינטרנט שמציג את קוד ה-QR כתמונה נוחה לסריקה
+app.get('/', (req, res) => {
+  if (isConnected) {
+    res.send(`
+      <!DOCTYPE html>
+      <html dir="rtl">
+      <head><meta charset="utf-8"><title>סטטוס וואטסאפ</title></head>
+      <body style="font-family:sans-serif;text-align:center;padding:50px;">
+        <h1 style="color:#25D366;">וואטסאפ מחובר בהצלחה! 🎉</h1>
+        <p style="font-size:18px;">השרת מוכן כעת לשימוש ב-Gemini Spark.</p>
+      </body>
+      </html>
+    `);
+  } else if (qrCodeText) {
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(qrCodeText)}`;
+    res.send(`
+      <!DOCTYPE html>
+      <html dir="rtl">
+      <head>
+        <meta charset="utf-8">
+        <title>סריקת קוד וואטסאפ</title>
+        <meta http-equiv="refresh" content="15">
+      </head>
+      <body style="font-family:sans-serif;text-align:center;padding:40px;">
+        <h2>סרוק את קוד ה-QR עם אפליקציית וואטסאפ</h2>
+        <p style="color:#555;">פתח את וואטסאפ בטלפון/טאבלט > הגדרות > מכשירים מקושרים > קשר מכשיר</p>
+        <div style="margin:20px 0;">
+          <img src="${qrUrl}" alt="QR Code" style="border: 4px solid #25D366; border-radius: 12px; padding: 10px;" />
+        </div>
+        <p style="color:gray;font-size:13px;">העמוד מתרענן אוטומטית כל 15 שניות</p>
+      </body>
+      </html>
+    `);
+  } else {
+    res.send(`
+      <!DOCTYPE html>
+      <html dir="rtl">
+      <head><meta charset="utf-8"><meta http-equiv="refresh" content="3"><title>טוען...</title></head>
+      <body style="font-family:sans-serif;text-align:center;padding:50px;">
+        <h2>מייצר קוד QR, אנא המתן מספר שניות...</h2>
+      </body>
+      </html>
+    `);
+  }
+});
+
+// שרת MCP לחיבור עם Gemini Spark
 const mcpServer = new Server({ name: 'whatsapp-mcp', version: '1.0.0' }, { capabilities: { tools: {} } });
 
 mcpServer.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -89,10 +131,6 @@ mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
   throw new Error('Unknown tool');
-});
-
-app.get('/', (req, res) => {
-  res.send(`Server is running! WhatsApp Status: ${isConnected ? 'Connected' : (qrCodeText ? 'Waiting for QR scan' : 'Connecting...')}`);
 });
 
 let transport;

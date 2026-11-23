@@ -13,7 +13,7 @@ const makeWASocket = typeof makeWASocketImport === 'function' ? makeWASocketImpo
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// רשימת הקבוצות המאושרות לשמירה (כל שאר הקבוצות יסוננו):
+// רשימת הקבוצות המאושרות לשמירה ולקריאה בלבד (השליחה פתוחה לכל הקבוצות):
 const ALLOWED_GROUPS = [
   'תכנה הפעלה חיה',
   'תוכנה הפעלה חיה',
@@ -27,7 +27,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE, HEAD');
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Access-Control-Expose-Headers', '*');
-  
+
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   if (req.method === 'HEAD') return res.status(200).end();
   next();
@@ -41,13 +41,17 @@ let isConnected = false;
 const messageHistory = []; // מאגר מוגדל של עד 200 הודעות
 const groupNameCache = new Map();
 
-// המרת מספר טלפון ישראלי/בינלאומי ל-JID תקין של וואטסאפ
+// המרת מספר טלפון ישראלי/בינלאומי ל-JID תקין של וואטסאפ (תומך גם במזהי קבוצה @g.us)
 function formatToJid(phone) {
-  let clean = phone.replace(/[^0-9]/g, '');
+  const trimmed = String(phone || '').trim();
+  if (trimmed.endsWith('@g.us') || trimmed.endsWith('@s.whatsapp.net') || trimmed.endsWith('@lid')) {
+    return trimmed;
+  }
+  let clean = trimmed.replace(/[^0-9]/g, '');
   if (clean.startsWith('0')) {
     clean = '972' + clean.slice(1);
   }
-  return clean.includes('@') ? clean : `${clean}@s.whatsapp.net`;
+  return `${clean}@s.whatsapp.net`;
 }
 
 // בדיקת שם קבוצה
@@ -61,6 +65,25 @@ async function getGroupName(jid) {
     }
   } catch (e) {}
   return '';
+}
+
+// שליפת כל הקבוצות (לשליחה ולחיפוש)
+async function getAllGroups() {
+  if (!sock || !isConnected) {
+    throw new Error('וואטסאפ אינו מחובר כרגע. אנא ודא חיבור בשרת.');
+  }
+  const groupsMap = await sock.groupFetchAllParticipating();
+  const result = [];
+  for (const [jid, meta] of Object.entries(groupsMap || {})) {
+    const subject = meta?.subject || '';
+    if (subject) groupNameCache.set(jid, subject);
+    result.push({
+      jid,
+      name: subject,
+      participantsCount: Array.isArray(meta?.participants) ? meta.participants.length : undefined,
+    });
+  }
+  return result;
 }
 
 // חילוץ תוכן טקסטואלי או סוג מדיה
@@ -80,7 +103,7 @@ function extractMessageContent(message) {
 
 async function connectToWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-  
+
   sock = makeWASocket({
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
@@ -111,7 +134,7 @@ async function connectToWhatsApp() {
       const isFromMe = msg.key.fromMe;
       let chatDisplayName = isFromMe ? '[אני]' : (msg.pushName || 'לקוח');
 
-      // סינון קבוצות
+      // סינון קבוצות בקריאה ושמירה בלבד
       if (isGroup) {
         const groupTitle = await getGroupName(sender);
         const isAllowed = ALLOWED_GROUPS.some(allowed => groupTitle.includes(allowed));
@@ -156,7 +179,7 @@ app.get('/qr', (req, res) => {
 // שרת MCP מורחב עבור Gemini Spark
 function createMcpServer() {
   const server = new Server(
-    { name: 'whatsapp-mcp', version: '2.0.0' },
+    { name: 'whatsapp-mcp', version: '2.1.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -190,6 +213,23 @@ function createMcpServer() {
         description: 'קבלת רשימה מרוכזת של כל הלקוחות והשיחות האחרונות שפנו אליך, כולל ההודעה האחרונה שלהם.',
         inputSchema: { type: 'object', properties: {} },
       },
+      {
+        name: 'list_groups',
+        description: 'קבלת רשימת כל קבוצות הוואטסאפ, כולל שם הקבוצה והמזהה שלה.',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'send_group_message',
+        description: 'שליחת הודעת וואטסאפ לכל קבוצה (לפי שם קבוצה או מזהה קבוצה).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            group: { type: 'string', description: 'שם הקבוצה (או חלק ממנו) או מזהה הקבוצה (@g.us)' },
+            message: { type: 'string', description: 'תוכן ההודעה לשליחה' },
+          },
+          required: ['group', 'message'],
+        },
+      },
     ],
   }));
 
@@ -200,12 +240,11 @@ function createMcpServer() {
     if (name === 'get_recent_messages') {
       const count = args?.count || 15;
       const search = args?.search?.toLowerCase();
-      
       let filtered = messageHistory;
       if (search) {
-        filtered = filtered.filter(m => 
-          m.text.toLowerCase().includes(search) || 
-          m.name.toLowerCase().includes(search) || 
+        filtered = filtered.filter(m =>
+          m.text.toLowerCase().includes(search) ||
+          m.name.toLowerCase().includes(search) ||
           m.from.includes(search)
         );
       }
@@ -222,7 +261,7 @@ function createMcpServer() {
       const targetJid = formatToJid(args.phone);
       await sock.sendMessage(targetJid, { text: args.message });
       return {
-        content: [{ type: 'text', text: `ההודעה נשלחה בהצלחה למספר ${args.phone}!` }],
+        content: [{ type: 'text', text: `ההודעה נשלחה בהצלחה אל ${args.phone}!` }],
       };
     }
 
@@ -239,6 +278,32 @@ function createMcpServer() {
       }
       return {
         content: [{ type: 'text', text: JSON.stringify(Array.from(chatsMap.values())) }],
+      };
+    }
+
+    // 4. רשימת כל הקבוצות
+    if (name === 'list_groups') {
+      const groups = await getAllGroups();
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ isConnected, groups }) }],
+      };
+    }
+
+    // 5. שליחת הודעה לכל קבוצה
+    if (name === 'send_group_message') {
+      const groups = await getAllGroups();
+      const query = String(args.group || '').trim();
+      const target = query.endsWith('@g.us')
+        ? groups.find(g => g.jid === query)
+        : groups.find(g => g.name.toLowerCase().includes(query.toLowerCase()));
+
+      if (!target) {
+        throw new Error(`לא נמצאה קבוצה התואמת ל-"${query}".`);
+      }
+
+      await sock.sendMessage(target.jid, { text: args.message });
+      return {
+        content: [{ type: 'text', text: `ההודעה נשלחה בהצלחה לקבוצה "${target.name}"!` }],
       };
     }
 

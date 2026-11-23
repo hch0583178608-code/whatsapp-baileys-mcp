@@ -33,7 +33,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 let sock;
 let qrCodeText = '';
@@ -52,6 +52,45 @@ function formatToJid(phone) {
     clean = '972' + clean.slice(1);
   }
   return `${clean}@s.whatsapp.net`;
+}
+
+// המרת קישורי שיתוף של Google Drive לקישור הורדה ישיר עבור מדיה
+function normalizeMediaUrl(rawUrl) {
+  const trimmed = String(rawUrl || '').trim();
+  const fileMatch = trimmed.match(/drive\.google\.com\/file\/d\/([^/?#]+)/i);
+  if (fileMatch) {
+    return `https://drive.google.com/uc?export=download&id=${fileMatch[1]}`;
+  }
+  const openMatch = trimmed.match(/drive\.google\.com\/open\?id=([^&#]+)/i);
+  if (openMatch) {
+    return `https://drive.google.com/uc?export=download&id=${openMatch[1]}`;
+  }
+  return trimmed;
+}
+
+// זיהוי יעד שליחה: מספר טלפון, מזהה JID, או שם קבוצה
+async function resolveRecipient(recipient) {
+  const query = String(recipient || '').trim();
+  if (!query) {
+    throw new Error('יש לציין נמען (מספר טלפון, שם קבוצה או מזהה קבוצה).');
+  }
+
+  if (query.endsWith('@g.us') || query.endsWith('@s.whatsapp.net') || query.endsWith('@lid')) {
+    return { jid: query, label: query };
+  }
+
+  // אם הקלט נראה כמו מספר טלפון (ספרות, +, רווחים, מקפים או סוגריים)
+  if (/^[\d+\s\-()]{7,}$/.test(query)) {
+    return { jid: formatToJid(query), label: query };
+  }
+
+  // אחרת, חיפוש בקבוצות לפי שם
+  const groups = await getAllGroups();
+  const target = groups.find(g => g.name.toLowerCase().includes(query.toLowerCase()));
+  if (!target) {
+    throw new Error(`לא נמצאה קבוצה התואמת ל-"${query}".`);
+  }
+  return { jid: target.jid, label: `הקבוצה "${target.name}"` };
 }
 
 // בדיקת שם קבוצה
@@ -179,7 +218,7 @@ app.get('/qr', (req, res) => {
 // שרת MCP מורחב עבור Gemini Spark
 function createMcpServer() {
   const server = new Server(
-    { name: 'whatsapp-mcp', version: '2.1.0' },
+    { name: 'whatsapp-mcp', version: '2.2.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -228,6 +267,23 @@ function createMcpServer() {
             message: { type: 'string', description: 'תוכן ההודעה לשליחה' },
           },
           required: ['group', 'message'],
+        },
+      },
+      {
+        name: 'send_whatsapp_media',
+        description: 'שליחת תמונה, סרטון או מסמך בוואטסאפ לכל מספר טלפון או לכל קבוצה (לפי שם קבוצה או מזהה). תומך בקישור ישיר (URL, כולל Google Drive) או ב-Base64.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            recipient: { type: 'string', description: 'מספר טלפון (למשל 0501234567), שם קבוצה (או חלק ממנו), או מזהה קבוצה (@g.us)' },
+            mediaType: { type: 'string', enum: ['image', 'video', 'document'], description: 'סוג המדיה לשליחה: image, video או document' },
+            url: { type: 'string', description: 'כתובת URL ציבורית לקובץ (אופציונלי אם מסופק base64)' },
+            base64: { type: 'string', description: 'תוכן הקובץ מקודד ב-Base64 (אופציונלי אם מסופק url)' },
+            caption: { type: 'string', description: 'כיתוב שיופיע מתחת למדיה (אופציונלי)' },
+            mimetype: { type: 'string', description: 'סוג MIME של הקובץ, למשל image/jpeg, video/mp4, application/pdf (אופציונלי)' },
+            fileName: { type: 'string', description: 'שם הקובץ לשליחה, רלוונטי בעיקר למסמכים (אופציונלי)' },
+          },
+          required: ['recipient', 'mediaType'],
         },
       },
     ],
@@ -304,6 +360,57 @@ function createMcpServer() {
       await sock.sendMessage(target.jid, { text: args.message });
       return {
         content: [{ type: 'text', text: `ההודעה נשלחה בהצלחה לקבוצה "${target.name}"!` }],
+      };
+    }
+
+    // 6. שליחת תמונה, סרטון או מסמך למספר פרטי או לקבוצה
+    if (name === 'send_whatsapp_media') {
+      if (!sock || !isConnected) {
+        throw new Error('וואטסאפ אינו מחובר כרגע. אנא ודא חיבור בשרת.');
+      }
+
+      const { recipient, mediaType, url, base64, caption, mimetype, fileName } = args || {};
+      if (!url && !base64) {
+        throw new Error('חובה לספק קישור (url) או תוכן מקודד (base64).');
+      }
+
+      const target = await resolveRecipient(recipient);
+
+      let mediaSource;
+      if (url) {
+        mediaSource = { url: normalizeMediaUrl(url) };
+      } else {
+        const cleanBase64 = String(base64).replace(/^data:[^;]+;base64,/, '').trim();
+        mediaSource = Buffer.from(cleanBase64, 'base64');
+      }
+
+      let messagePayload;
+      if (mediaType === 'image') {
+        messagePayload = {
+          image: mediaSource,
+          ...(caption ? { caption } : {}),
+          ...(mimetype ? { mimetype } : {}),
+        };
+      } else if (mediaType === 'video') {
+        messagePayload = {
+          video: mediaSource,
+          ...(caption ? { caption } : {}),
+          ...(mimetype ? { mimetype } : {}),
+        };
+      } else if (mediaType === 'document') {
+        messagePayload = {
+          document: mediaSource,
+          fileName: fileName || 'file',
+          mimetype: mimetype || 'application/octet-stream',
+          ...(caption ? { caption } : {}),
+        };
+      } else {
+        throw new Error(`סוג מדיה לא נתמך: ${mediaType}. יש לבחור image, video או document.`);
+      }
+
+      await sock.sendMessage(target.jid, messagePayload);
+      return {
+        content: [{ type: 'text', text: `הקובץ (${mediaType}) נשלח בהצלחה אל ${target.label}!` }],
       };
     }
 
